@@ -1,0 +1,12 @@
+# Ignorer les fichiers de données (Protection des données clients)
+*.csv
+*.xml
+*.json
+
+# Ignorer les environnements virtuels et caches Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+.DS_Store
