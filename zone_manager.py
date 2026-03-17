@@ -182,7 +182,7 @@ if 'search_query' not in st.session_state: st.session_state.search_query = ""
 if 'selected_client_idx' not in st.session_state: st.session_state.selected_client_idx = None
 
 # --- PARSEURS ZONES ---
-def handle_xml(content):
+def handle_xml(content, filename):
     try:
         root = ET.fromstring(content)
         new_zones = []
@@ -193,14 +193,15 @@ def handle_xml(content):
                 "name": z.find('name').text if z.find('name') is not None else "Zone",
                 "startdepot": z.find('startdepot').text if z.find('startdepot') is not None else "33",
                 "polygon": z.find('polygon').text if z.find('polygon') is not None else "",
-                "color": None
+                "color": None,
+                "source_file": filename
             })
             st.session_state[f"state_chk_{z_id}"] = True 
         st.session_state.zones.extend(new_zones)
     except ET.ParseError: st.error("Le fichier XML est mal formé.")
     except Exception as e: st.error(f"Erreur XML: {e}")
 
-def handle_json(content):
+def handle_json(content, filename):
     try:
         data = json.loads(content)
         raw_zones = data[0].get('zones', []) if isinstance(data, list) else data.get('zones', [])
@@ -214,7 +215,8 @@ def handle_json(content):
                 "name": z.get('name', 'Zone JSON'),
                 "startdepot": "33",
                 "polygon": ";".join(merc_list),
-                "color": z.get('color', None)
+                "color": z.get('color', None),
+                "source_file": filename
             })
             st.session_state[f"state_chk_{z_id}"] = True
         st.session_state.zones.extend(new_zones)
@@ -241,7 +243,14 @@ def run_zoning_algorithm(df):
                 if zp['poly'].contains(p): 
                     return format_ilot_name(zp['name']), "Validé"
         except (ValueError, IndexError): pass
-        statut = "Validé" if pd.notna(row['Ilôt']) and str(row['Ilôt']).strip() != "" else "À corriger"
+        
+        ilot_val = str(row['Ilôt']).strip().lower()
+        statut = "Validé" if pd.notna(row['Ilôt']) and ilot_val != "" and ilot_val != "nan" else "À corriger"
+        
+        # Sécurisation pour conserver le statut manuel si on recalcule
+        if statut == "Validé" and 'Statut_Forge' in row and pd.notna(row['Statut_Forge']) and 'Manuel' in str(row['Statut_Forge']):
+            statut = row['Statut_Forge']
+                    
         return row['Ilôt'], statut
 
     progress_bar = st.progress(0, text="Mise à jour des affectations...")
@@ -258,7 +267,7 @@ def run_zoning_algorithm(df):
     return df
 
 # --- MOTEUR DE CARTE ---
-def render_forge_map(selected_zones, clients_df=None, focus_point=None, map_view_state=None):
+def render_forge_map(selected_zones, clients_df=None, focus_point=None, map_view_state=None, polygon_opacity=0.2):
     zones_js = []
     all_coords = []
     unselected_zones_js = [] 
@@ -322,19 +331,65 @@ def render_forge_map(selected_zones, clients_df=None, focus_point=None, map_view
             attribution: '© OpenStreetMap, © CARTO'
         }});
         
+        var detailedMap = L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+            maxZoom: 19,
+            attribution: '© OpenStreetMap'
+        }});
+        
         var satelliteMap = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}', {{
             maxZoom: 19,
             attribution: 'Tiles © Esri'
         }});
 
+        var baseMaps = {{ "Plan Clair": lightMap, "Carte Détaillée": detailedMap, "Satellite": satelliteMap }};
+        
+        var startCenter = {center};
+        var startZoom = {zoom_level};
+        var isFocus = {str(bool(focus_point)).lower()};
+        var activeLayerName = "Plan Clair";
+        
+        // --- RESTAURATION DE LA VUE (Zoom, Centre, Calque) ---
+        var savedMapState = null;
+        try {{
+            var stateStr = sessionStorage.getItem('vcp_map_state');
+            if (stateStr) {{
+                savedMapState = JSON.parse(stateStr);
+                if (!isFocus) {{
+                    startCenter = [savedMapState.lat, savedMapState.lng];
+                    startZoom = savedMapState.zoom;
+                }}
+                if (savedMapState.layer && baseMaps[savedMapState.layer]) {{
+                    activeLayerName = savedMapState.layer;
+                }}
+            }}
+        }} catch(e) {{}}
+
         var map = L.map('map', {{ 
             doubleClickZoom: false,
-            layers: [lightMap] // La vue "Plan Clair" reste la vue par défaut au chargement
-        }}).setView({center}, {zoom_level});
-        
-        var baseMaps = {{ "Plan Clair": lightMap, "Satellite": satelliteMap }};
+            layers: [baseMaps[activeLayerName]]
+        }}).setView(startCenter, startZoom);
         
         L.control.layers(baseMaps, null, {{position: 'topright'}}).addTo(map);
+        
+        // --- SAUVEGARDE CONTINUE DE LA VUE ---
+        function saveCurrentMapState() {{
+            try {{
+                var state = {{
+                    lat: map.getCenter().lat,
+                    lng: map.getCenter().lng,
+                    zoom: map.getZoom(),
+                    layer: activeLayerName
+                }};
+                sessionStorage.setItem('vcp_map_state', JSON.stringify(state));
+            }} catch(e) {{}}
+        }}
+        
+        map.on('moveend', saveCurrentMapState);
+        map.on('zoomend', saveCurrentMapState);
+        map.on('baselayerchange', function(e) {{
+            activeLayerName = e.name;
+            saveCurrentMapState();
+        }});
         
         map.pm.setGlobalOptions({{
             snappable: true, snapDistance: 20, allowSelfIntersection: false,
@@ -396,6 +451,7 @@ def render_forge_map(selected_zones, clients_df=None, focus_point=None, map_view
         var focus = {json.dumps(focus_point)};
         var savedMapView = {json.dumps(map_view_state)};
         var vcpPalette = {json.dumps(VCP_PALETTE)};
+        var polyOpacity = {polygon_opacity};
         var bounds = L.latLngBounds();
         
         var clientMarkers = []; 
@@ -424,7 +480,7 @@ def render_forge_map(selected_zones, clients_df=None, focus_point=None, map_view
         }}
 
         zones.forEach(function(z) {{
-            var poly = L.polygon(z.coords, {{color: z.color, fillOpacity: 0.2, weight: 2}});
+            var poly = L.polygon(z.coords, {{color: z.color, fillOpacity: polyOpacity, weight: 2}});
             poly.bindTooltip(z.name);
             poly.customName = z.name;
             poly.customId = z.id;
@@ -705,6 +761,7 @@ def render_forge_map(selected_zones, clients_df=None, focus_point=None, map_view
             var layer = e.layer;
             layer.customName = "Nouvelle Zone";
             layer.options.color = '#6366f1'; // Couleur par défaut
+            layer.setStyle({{fillOpacity: polyOpacity}});
             layer.bindPopup(createColorPopup(layer));
             drawnItems.addLayer(layer);
             layer.on('pm:edit', updateVisualStatus);
@@ -752,7 +809,7 @@ def render_forge_map(selected_zones, clients_df=None, focus_point=None, map_view
         }});
         map.addControl(new autoSaveControl());
 
-        if (!focus && !savedMapView && (zones.length > 0 || clients.length > 0)) map.fitBounds(bounds, {{padding: [40, 40]}});
+        if (!focus && !savedMapView && !savedMapState && (zones.length > 0 || clients.length > 0)) map.fitBounds(bounds, {{padding: [40, 40]}});
         updateVisualStatus(); 
     </script>
     """
@@ -829,7 +886,8 @@ def main():
                                 "name": updated_z['name'],
                                 "startdepot": "33",
                                 "polygon": ";".join(merc_list),
-                                "color": updated_z.get('color')
+                                "color": updated_z.get('color'),
+                                "source_file": "Nouveaux_Secteurs.json"
                             })
                             st.session_state[f"state_chk_{z_id}"] = True
                             st.session_state[f"ui_chk_{z_id}"] = True
@@ -863,107 +921,166 @@ def main():
         st.markdown('<div style="display: flex; justify-content: center; background-color: #eef2ff; padding: 12px; border-radius: 16px; margin-bottom: 10px;"><img src="https://www.lg-presse.fr/gallery/logo%20LG%20Presse.jpg?ts=1771514472" width="75" style="border-radius: 8px; mix-blend-mode: multiply;"></div>', unsafe_allow_html=True)
         st.markdown("<h3 style='text-align: center;' title='Importez vos secteurs (JSON/XML) puis vos clients (CSV) dans le menu de gauche.'>🗺️ LG Precision Repérages <span style='cursor: help; color: #94a3b8; font-size: 0.8em;'>❔</span></h3>", unsafe_allow_html=True)
         
-        with st.expander("1️⃣ Importation Secteurs", expanded=not st.session_state.zones):
-            files = st.file_uploader("Fichiers XML/JSON", accept_multiple_files=True)
-            if st.button("Charger Secteurs", use_container_width=True):
-                for f in files:
-                    content = f.read().decode("utf-8")
-                    if f.name.endswith('.json'): handle_json(content)
-                    else: handle_xml(content)
-                st.rerun()
+        tab_data, tab_tools = st.tabs(["🗂️ Fichiers", "🗺️ Calques & Filtres"])
+        
+        with tab_data:
+            st.markdown("#### 📥 Importations")
+            with st.expander("1️⃣ Secteurs (JSON/XML)", expanded=not st.session_state.zones):
+                files = st.file_uploader("Fichiers XML/JSON", accept_multiple_files=True, label_visibility="collapsed")
+                if st.button("Charger Secteurs", use_container_width=True):
+                    for f in files:
+                        content = f.read().decode("utf-8")
+                        if f.name.endswith('.json'): handle_json(content, f.name)
+                        else: handle_xml(content, f.name)
+                    st.rerun()
 
-        with st.expander("2️⃣ Importation Clients", expanded=(bool(st.session_state.zones) and st.session_state.clients_df is None)):
-            csv_file = st.file_uploader("Fichier CSV (Jade)", type=['csv'])
-            if csv_file and st.button("Traiter les Clients", use_container_width=True):
-                try:
-                    csv_file.seek(0)
-                    df = pd.read_csv(csv_file, sep=None, engine='python', encoding='utf-8') 
-                except UnicodeDecodeError:
-                    # Si le fichier contient des accents au format Windows/Excel (Latin-1)
-                    csv_file.seek(0)
+            with st.expander("2️⃣ Clients (CSV)", expanded=(bool(st.session_state.zones) and st.session_state.clients_df is None)):
+                csv_file = st.file_uploader("Fichier CSV (Jade)", type=['csv'], label_visibility="collapsed")
+                if csv_file and st.button("Traiter les Clients", use_container_width=True):
                     try:
-                        df = pd.read_csv(csv_file, sep=None, engine='python', encoding='latin-1')
+                        csv_file.seek(0)
+                        df = pd.read_csv(csv_file, sep=None, engine='python', encoding='utf-8') 
+                    except UnicodeDecodeError:
+                        # Si le fichier contient des accents au format Windows/Excel (Latin-1)
+                        csv_file.seek(0)
+                        try:
+                            df = pd.read_csv(csv_file, sep=None, engine='python', encoding='latin-1')
+                        except Exception as e:
+                            st.error(f"Erreur lecture CSV (latin-1): {e}")
+                            return
                     except Exception as e:
-                        st.error(f"Erreur lecture CSV (latin-1): {e}")
+                        st.error(f"Erreur lecture CSV: {e}")
                         return
-                except Exception as e:
-                    st.error(f"Erreur lecture CSV: {e}")
-                    return
-                
-                df = run_zoning_algorithm(df)
-                st.session_state.clients_df = df
-                st.success("Traitement terminé !")
-                st.rerun()
+                    
+                    df = run_zoning_algorithm(df)
+                    st.session_state.clients_df = df
+                    st.success("Traitement terminé !")
+                    st.rerun()
 
-        st.divider()
+            if st.session_state.clients_df is not None or st.session_state.zones:
+                st.divider()
+                st.markdown("#### 📤 Exportations")
 
-        show_only_anomalies = False
-        if st.session_state.clients_df is not None:
-            st.markdown("### 🛠️ Outils & Exportation")
-            show_only_anomalies = st.checkbox("🚨 Ne montrer que les anomalies", value=False, help="Masque les clients déjà validés pour se concentrer sur les corrections.")
-            
-            st.caption("Téléchargez votre CSV avec les Ilôts assignés.")
-            
-            export_df = st.session_state.clients_df.copy()
-            
-            # Identifier les lignes en anomalie (sans Ilôt défini)
-            is_missing_ilot = export_df['Ilôt'].isna() | (export_df['Ilôt'].astype(str).str.strip() == '') | (export_df['Ilôt'].astype(str).str.lower() == 'nan')
-            is_anomaly = export_df['Statut_Forge'] == "À corriger"
-            anomalies_mask = is_missing_ilot & is_anomaly
-            
-            if anomalies_mask.any():
-                anomalies_count = anomalies_mask.sum()
-                if st.button("📥 Télécharger CSV", use_container_width=True, type="primary"):
-                    export_confirmation_dialog(export_df, anomalies_mask, anomalies_count)
-            else:
-                # Aucune anomalie, export direct classique
-                export_df = export_df.drop(columns=['Statut_Forge'])
-                csv_data = export_df.to_csv(index=False, sep=';').encode('utf-8-sig')
-                st.download_button("📥 Télécharger CSV", csv_data, "campagne_forge_ok.csv", "text/csv", use_container_width=True, type="primary")
-            
-            st.divider()
+                if st.session_state.clients_df is not None:
+                    st.caption("📄 **Clients** : Téléchargez votre CSV avec les Ilôts assignés.")
+                    export_df = st.session_state.clients_df.copy()
+                    
+                    is_missing_ilot = export_df['Ilôt'].isna() | (export_df['Ilôt'].astype(str).str.strip() == '') | (export_df['Ilôt'].astype(str).str.lower() == 'nan')
+                    is_anomaly = export_df['Statut_Forge'] == "À corriger"
+                    anomalies_mask = is_missing_ilot & is_anomaly
+                    
+                    if anomalies_mask.any():
+                        anomalies_count = anomalies_mask.sum()
+                        if st.button("📥 Télécharger CSV", use_container_width=True, type="primary"):
+                            export_confirmation_dialog(export_df, anomalies_mask, anomalies_count)
+                    else:
+                        export_df = export_df.drop(columns=['Statut_Forge'])
+                        csv_data = export_df.to_csv(index=False, sep=';').encode('utf-8-sig')
+                        st.download_button("📥 Télécharger CSV", csv_data, "campagne_forge_ok.csv", "text/csv", use_container_width=True, type="primary")
 
-        if st.session_state.zones:
-            st.markdown("### 📋 Secteurs")
-            
-            def clear_search():
-                st.session_state.search_query = ""
-                
-            st.markdown("**🔍 Rechercher un secteur...**")
-            c_search, c_clear = st.columns([5, 1])
-            with c_search:
-                st.text_input("Recherche", placeholder="Ex: LB03...", key="search_query", label_visibility="collapsed")
-            with c_clear:
-                st.button("❌", on_click=clear_search, help="Effacer la recherche", use_container_width=True)
-            
-            query = st.session_state.search_query
-            filtered_zones = [z for z in st.session_state.zones if query.lower() in z['name'].lower()]
-            
-            st.caption(f"💡 Double-cliquez sur la carte pour révéler un secteur masqué. ({len(filtered_zones)}/{len(st.session_state.zones)} affichés)")
-            
-            c_all, c_none = st.columns(2)
-            if c_all.button("Tout cocher", use_container_width=True):
-                for z in filtered_zones: 
-                    st.session_state[f"state_chk_{z['id']}"] = True
-                    st.session_state[f"ui_chk_{z['id']}"] = True
-                st.rerun()
-                
-            def uncheck_all_zones():
-                for z in st.session_state.zones:
-                    st.session_state[f"state_chk_{z['id']}"] = False
-                    st.session_state[f"ui_chk_{z['id']}"] = False
-                st.session_state.search_query = ""
-                
-            c_none.button("Tout décocher", use_container_width=True, on_click=uncheck_all_zones)
-            
-            with st.container(height=400):
-                sorted_zones = sorted(filtered_zones, key=lambda x: x['name'])
-                
-                def toggle_zone(z_id):
-                    st.session_state[f"state_chk_{z_id}"] = st.session_state[f"ui_chk_{z_id}"]
+                if st.session_state.zones:
+                    st.caption("🗺️ **Secteurs** : Téléchargez les fichiers d'origine avec polygones modifiés.")
+                    zones_by_file = {}
+                    for z in st.session_state.zones:
+                        src = z.get('source_file', 'Secteurs_Inconnus.json')
+                        if src not in zones_by_file:
+                            zones_by_file[src] = []
+                        zones_by_file[src].append(z)
+                        
+                    for src_file, z_list in zones_by_file.items():
+                        if src_file.endswith('.json'):
+                            out_data = {"zones": []}
+                            for z in z_list:
+                                raw = [float(p) for p in z['polygon'].split(';') if p]
+                                pts = [mercator_to_latlng(raw[i], raw[i+1]) for i in range(0, len(raw), 2)]
+                                poly_coords = [[[pt[1], pt[0]] for pt in pts]]
+                                out_data["zones"].append({
+                                    "name": z['name'],
+                                    "color": z.get('color'),
+                                    "polygon": {
+                                        "geometry": {
+                                            "type": "Polygon",
+                                            "coordinates": poly_coords
+                                        }
+                                    }
+                                })
+                            
+                            json_str = json.dumps(out_data, indent=2, ensure_ascii=False).encode('utf-8')
+                            st.download_button(
+                                label=f"📥 Télécharger {src_file}",
+                                data=json_str,
+                                file_name=f"corrige_{src_file}",
+                                mime="application/json",
+                                use_container_width=True
+                            )
 
-                for z in sorted_zones:
-                    st.checkbox(f"{z['name']}", value=st.session_state.get(f"state_chk_{z['id']}", False), key=f"ui_chk_{z['id']}", on_change=toggle_zone, args=(z['id'],))
+        with tab_tools:
+            if st.session_state.clients_df is not None or st.session_state.zones:
+                st.markdown("#### 🛠️ Outils Globaux")
+                if st.session_state.clients_df is not None:
+                    st.checkbox("🚨 Ne montrer que les anomalies", key="show_only_anomalies", help="Masque les clients déjà validés pour se concentrer sur les corrections.")
+                if st.session_state.zones:
+                    st.slider("Opacité des secteurs", min_value=0.0, max_value=1.0, value=0.2, step=0.1, key="polygon_opacity", help="Ajuste la transparence des polygones colorés.")
+                st.divider()
+
+            if st.session_state.zones:
+                st.markdown("#### 📋 Liste des Secteurs")
+                
+                def clear_search():
+                    st.session_state.search_query = ""
+                    
+                c_search, c_clear = st.columns([5, 1])
+                with c_search:
+                    st.text_input("Recherche", placeholder="Ex: LB03...", key="search_query", label_visibility="collapsed")
+                with c_clear:
+                    st.button("❌", on_click=clear_search, help="Effacer la recherche", use_container_width=True)
+                
+                query = st.session_state.search_query
+                filtered_zones = [z for z in st.session_state.zones if query.lower() in z['name'].lower()]
+                
+                st.caption(f"💡 Double-cliquez sur la carte pour révéler un secteur masqué. ({len(filtered_zones)}/{len(st.session_state.zones)} affichés)")
+                
+                c_all, c_none = st.columns(2)
+                if c_all.button("Tout cocher", use_container_width=True):
+                    for z in filtered_zones: 
+                        st.session_state[f"state_chk_{z['id']}"] = True
+                        st.session_state[f"ui_chk_{z['id']}"] = True
+                    st.rerun()
+                    
+                def uncheck_all_zones():
+                    for z in st.session_state.zones:
+                        st.session_state[f"state_chk_{z['id']}"] = False
+                        st.session_state[f"ui_chk_{z['id']}"] = False
+                    st.session_state.search_query = ""
+                    
+                c_none.button("Tout décocher", use_container_width=True, on_click=uncheck_all_zones)
+                
+                sort_mode = st.radio("Tri des secteurs :", ["🔤 Alphabétique", "🎨 Par couleur"], horizontal=True, label_visibility="collapsed")
+                
+                with st.container(height=400):
+                    if "couleur" in sort_mode.lower():
+                        def sort_key(z):
+                            idx = st.session_state.zones.index(z)
+                            color = z.get('color') or get_zone_color(idx)
+                            return (str(color).lower(), str(z['name']).lower())
+                        sorted_zones = sorted(filtered_zones, key=sort_key)
+                    else:
+                        sorted_zones = sorted(filtered_zones, key=lambda x: str(x['name']).lower())
+                    
+                    def toggle_zone(z_id):
+                        st.session_state[f"state_chk_{z_id}"] = st.session_state[f"ui_chk_{z_id}"]
+
+                    for z in sorted_zones:
+                        idx = st.session_state.zones.index(z)
+                        color = z.get('color') or get_zone_color(idx)
+                        
+                        c_color, c_check = st.columns([0.15, 0.85])
+                        with c_color:
+                            st.markdown(f"<div style='margin-top: 0.45rem; width: 14px; height: 14px; border-radius: 50%; background-color: {color}; box-shadow: 0 1px 2px rgba(0,0,0,0.2);'></div>", unsafe_allow_html=True)
+                        with c_check:
+                            st.checkbox(f"{z['name']}", value=st.session_state.get(f"state_chk_{z['id']}", False), key=f"ui_chk_{z['id']}", on_change=toggle_zone, args=(z['id'],))
+            elif st.session_state.clients_df is None:
+                st.info("👈 Commencez par importer des données dans l'onglet **Fichiers** pour débloquer ces options.")
 
     # --- MAIN UI ---
     selected_zones = [z for z in st.session_state.zones if st.session_state.get(f"state_chk_{z['id']}", False)]
@@ -1119,11 +1236,27 @@ def main():
                         st.session_state.selected_client_idx = None; st.rerun()
 
     map_df = st.session_state.clients_df
-    if show_only_anomalies and map_df is not None:
-        map_df = map_df[map_df['Statut_Forge'] == "À corriger"]
+    if st.session_state.get('show_only_anomalies', False) and map_df is not None:
+        # Filtre strictement spatial : afficher uniquement les points qui ne sont PAS dans les polygones sélectionnés
+        zone_polys = [get_shapely_polygon(z['polygon']) for z in selected_zones]
+        zone_polys = [p for p in zone_polys if p is not None]
+        
+        def is_outside(row):
+            try:
+                p = Point(float(row['latitude']), float(row['longitude']))
+                for poly in zone_polys:
+                    if poly.contains(p):
+                        return False
+                return True
+            except:
+                return True
+                
+        mask = map_df.apply(is_outside, axis=1)
+        map_df = map_df[mask]
 
     map_view_state = st.session_state.pop("saved_map_view", None)
-    render_forge_map(selected_zones, map_df, focus_point=focus_point, map_view_state=map_view_state)
+    poly_opacity = st.session_state.get("polygon_opacity", 0.2)
+    render_forge_map(selected_zones, map_df, focus_point=focus_point, map_view_state=map_view_state, polygon_opacity=poly_opacity)
 
 if __name__ == "__main__":
     main()
