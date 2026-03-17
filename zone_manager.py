@@ -1,14 +1,5 @@
 import os
 import streamlit as st
-import xml.etree.ElementTree as ET
-import json
-import math
-import pandas as pd
-import uuid
-import urllib.request
-import urllib.parse
-from datetime import datetime
-from shapely.geometry import Point, Polygon
 
 # --- FORCER LE THEME CLAIR NATIVEMENT ---
 def setup_light_theme():
@@ -40,6 +31,26 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# --- INDICATEUR DE RÉVEIL ---
+loading_placeholder = st.empty()
+if 'app_ready' not in st.session_state:
+    loading_placeholder.info("⏳ Sortie de veille et chargement des moteurs géographiques en cours... Merci de patienter.")
+
+# Chargement différé des bibliothèques lourdes
+import xml.etree.ElementTree as ET
+import json
+import math
+import pandas as pd
+import uuid
+import urllib.request
+import urllib.parse
+from datetime import datetime
+from shapely.geometry import Point, Polygon
+
+if 'app_ready' not in st.session_state:
+    st.session_state.app_ready = True
+    loading_placeholder.empty()
 
 # --- PALETTE DE COULEURS ---
 VCP_PALETTE = ["#6366f1", "#10b981", "#f43f5e", "#f59e0b", "#06b6d4", "#8b5cf6", "#f97316", "#84cc16"]
