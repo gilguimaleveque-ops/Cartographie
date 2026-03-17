@@ -258,7 +258,7 @@ def run_zoning_algorithm(df):
     return df
 
 # --- MOTEUR DE CARTE ---
-def render_forge_map(selected_zones, clients_df=None, focus_point=None):
+def render_forge_map(selected_zones, clients_df=None, focus_point=None, map_view_state=None):
     zones_js = []
     all_coords = []
     unselected_zones_js = [] 
@@ -290,8 +290,13 @@ def render_forge_map(selected_zones, clients_df=None, focus_point=None):
                 all_coords.append([float(row['latitude']), float(row['longitude'])])
 
     center = [44.837789, -0.57918]
+    zoom_level = 12
     if focus_point:
         center = focus_point
+        zoom_level = 18
+    elif map_view_state:
+        center = [map_view_state['lat'], map_view_state['lng']]
+        zoom_level = map_view_state['zoom']
     elif all_coords:
         center = [sum(p[0] for p in all_coords)/len(all_coords), sum(p[1] for p in all_coords)/len(all_coords)]
 
@@ -325,7 +330,7 @@ def render_forge_map(selected_zones, clients_df=None, focus_point=None):
         var map = L.map('map', {{ 
             doubleClickZoom: false,
             layers: [lightMap] // La vue "Plan Clair" reste la vue par défaut au chargement
-        }}).setView({center}, {18 if focus_point else 12});
+        }}).setView({center}, {zoom_level});
         
         var baseMaps = {{ "Plan Clair": lightMap, "Satellite": satelliteMap }};
         
@@ -344,10 +349,52 @@ def render_forge_map(selected_zones, clients_df=None, focus_point=None):
             removalMode: true, rotateMode: false,
         }});
 
+        // --- BOUTON PLEIN ÉCRAN ---
+        var FullscreenControl = L.Control.extend({{
+            options: {{ position: 'topleft' }},
+            onAdd: function(map) {{
+                var container = L.DomUtil.create('div', 'leaflet-bar leaflet-control');
+                container.style.backgroundColor = 'white';
+                container.style.width = '34px';
+                container.style.height = '34px';
+                container.style.cursor = 'pointer';
+                container.style.display = 'flex';
+                container.style.alignItems = 'center';
+                container.style.justifyContent = 'center';
+                container.title = 'Plein écran';
+                
+                var iconFullscreen = '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#475569" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"></path></svg>';
+                var iconExit = '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#475569" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3"></path></svg>';
+                
+                container.innerHTML = iconFullscreen;
+                
+                container.onclick = function(e){{
+                    e.preventDefault();
+                    if (!document.fullscreenElement) {{
+                        document.documentElement.requestFullscreen().catch(err => console.log(err));
+                    }} else {{
+                        if (document.exitFullscreen) document.exitFullscreen();
+                    }}
+                }};
+                
+                container.onmouseover = function() {{ container.style.backgroundColor = '#f1f5f9'; }};
+                container.onmouseout = function() {{ container.style.backgroundColor = 'white'; }};
+                
+                document.addEventListener('fullscreenchange', (event) => {{
+                    if (document.fullscreenElement) {{ container.innerHTML = iconExit; container.title = 'Quitter le plein écran'; }}
+                    else {{ container.innerHTML = iconFullscreen; container.title = 'Plein écran'; }}
+                }});
+                
+                return container;
+            }}
+        }});
+        map.addControl(new FullscreenControl());
+
         var zones = {json.dumps(zones_js)};
         var unselectedZones = {json.dumps(unselected_zones_js)};
         var clients = {json.dumps(clients_js)};
         var focus = {json.dumps(focus_point)};
+        var savedMapView = {json.dumps(map_view_state)};
         var vcpPalette = {json.dumps(VCP_PALETTE)};
         var bounds = L.latLngBounds();
         
@@ -545,7 +592,7 @@ def render_forge_map(selected_zones, clients_df=None, focus_point=None):
                 
                 if (inputNode) {{
                     // 1. Prendre le focus pour simuler l'utilisateur
-                    inputNode.focus();
+                    inputNode.focus({{ preventScroll: true }});
                     
                     // 2. Injecter la donnée JSON sans alerter React tout de suite
                     var nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set;
@@ -691,7 +738,9 @@ def render_forge_map(selected_zones, clients_df=None, focus_point=None):
                         outZones.push({{ id: layer.customId, name: layer.customName || "Zone", polygon: layer.toGeoJSON(), color: layer.options.color }});
                     }});
                     
-                    if (sendToPython({{ action: "save", zones: outZones, ts: Date.now() }})) {{
+                    var currentCenter = map.getCenter();
+                    var currentZoom = map.getZoom();
+                    if (sendToPython({{ action: "save", zones: outZones, map_view: {{lat: currentCenter.lat, lng: currentCenter.lng, zoom: currentZoom}}, ts: Date.now() }})) {{
                         container.innerHTML = '<div style="background:#059669; color:white; padding:10px 16px; border-radius:8px; font-weight:800; font-family:Inter,sans-serif; font-size:14px; box-shadow:0 4px 6px rgba(0,0,0,0.2); display:flex; align-items:center; gap:8px;">✅ Validé !</div>';
                         setTimeout(() => {{ 
                             container.innerHTML = '<div style="background:#10b981; color:white; padding:10px 16px; border-radius:8px; font-weight:800; font-family:Inter,sans-serif; font-size:14px; box-shadow:0 4px 6px rgba(0,0,0,0.2); display:flex; align-items:center; gap:8px;">💾 Enregistrer et Recalculer</div>';
@@ -703,18 +752,18 @@ def render_forge_map(selected_zones, clients_df=None, focus_point=None):
         }});
         map.addControl(new autoSaveControl());
 
-        if (!focus && (zones.length > 0 || clients.length > 0)) map.fitBounds(bounds, {{padding: [40, 40]}});
+        if (!focus && !savedMapView && (zones.length > 0 || clients.length > 0)) map.fitBounds(bounds, {{padding: [40, 40]}});
         updateVisualStatus(); 
     </script>
     """
-    st.components.v1.html(map_html, height=850)
+    st.components.v1.html(map_html, height=700)
 
 @st.dialog("⚠️ Confirmation requise")
 def export_confirmation_dialog(export_df, anomalies_mask, anomalies_count):
-    st.warning(f"{anomalies_count} lignes en anomalies sont affectées au code ZZ99. L'opérateur doit confirmer ou annuler (oui/non)")
+    st.warning(f"{anomalies_count} lignes en anomalies sont affectées au code ZZ99A. L'opérateur doit confirmer ou annuler (oui/non)")
     
-    # Application des règles ZZ99 et 'non'
-    export_df.loc[anomalies_mask, 'Ilôt'] = 'ZZ99'
+    # Application des règles ZZ99A et 'non'
+    export_df.loc[anomalies_mask, 'Ilôt'] = 'ZZ99A'
     export_df.loc[anomalies_mask, 'Statut Portage'] = 'non'
     export_df = export_df.drop(columns=['Statut_Forge'])
     
@@ -787,6 +836,9 @@ def main():
 
                 if st.session_state.clients_df is not None:
                     st.session_state.clients_df = run_zoning_algorithm(st.session_state.clients_df)
+                
+                if "map_view" in payload:
+                    st.session_state.saved_map_view = payload["map_view"]
                 st.toast("✅ Frontières enregistrées et Clients recalculés !", icon="💾")
                 
             # Action 2 : Activation au double clic
@@ -972,7 +1024,26 @@ def main():
                             st.session_state.clients_df.at[real_idx, "Ilôt"] = changes["Ilôt"]
                             st.session_state.clients_df.at[real_idx, "Statut_Forge"] = "Validé (Manuel)"
         else:
-            st.success("✅ Tous les clients sont correctement affectés aux zones.")
+            st.markdown("""
+                <style>
+                @keyframes fade-out-success {
+                    0% { opacity: 1; max-height: 100px; padding: 1rem; margin-bottom: 1rem; }
+                    80% { opacity: 1; max-height: 100px; padding: 1rem; margin-bottom: 1rem; }
+                    100% { opacity: 0; max-height: 0; padding: 0; margin-bottom: 0; overflow: hidden; display: none; }
+                }
+                .auto-hide-msg {
+                    animation: fade-out-success 5s forwards;
+                    background-color: #d1fae5;
+                    color: #065f46;
+                    padding: 1rem;
+                    border-radius: 0.5rem;
+                    display: flex;
+                    align-items: center;
+                    font-size: 1rem;
+                }
+                </style>
+                <div class="auto-hide-msg">✅ Tous les clients sont correctement affectés aux zones.</div>
+            """, unsafe_allow_html=True)
 
     # --- BLOC ÉDITION CLIENT ---
     if st.session_state.get('selected_client_idx') is not None:
@@ -1051,7 +1122,8 @@ def main():
     if show_only_anomalies and map_df is not None:
         map_df = map_df[map_df['Statut_Forge'] == "À corriger"]
 
-    render_forge_map(selected_zones, map_df, focus_point=focus_point)
+    map_view_state = st.session_state.pop("saved_map_view", None)
+    render_forge_map(selected_zones, map_df, focus_point=focus_point, map_view_state=map_view_state)
 
 if __name__ == "__main__":
     main()
