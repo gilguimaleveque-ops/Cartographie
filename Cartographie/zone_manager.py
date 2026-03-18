@@ -9,16 +9,24 @@ def setup_light_theme():
         config_path = os.path.join(st_dir, "config.toml")
         
         theme_config = '[theme]\nbase="light"\nprimaryColor="#6366f1"\n'
+        server_config = '[server]\nfileWatcherType="none"\n'
         
         if not os.path.exists(config_path):
             with open(config_path, "w") as f:
-                f.write(theme_config)
+                f.write(server_config + "\n" + theme_config)
         else:
             with open(config_path, "r") as f:
                 content = f.read()
-            if 'base="light"' not in content:
+                
+            new_content = content
+            if 'fileWatcherType' not in new_content:
+                new_content = server_config + "\n" + new_content
+            if 'base="light"' not in new_content:
+                new_content = theme_config + "\n" + new_content
+                
+            if new_content != content:
                 with open(config_path, "w") as f:
-                    f.write(theme_config + "\n" + content)
+                    f.write(new_content)
     except:
         pass
 
