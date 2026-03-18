@@ -215,7 +215,16 @@ def handle_xml(content, filename):
 def handle_json(content, filename):
     try:
         data = json.loads(content)
-        raw_zones = data[0].get('zones', []) if isinstance(data, list) else data.get('zones', [])
+        raw_data = data[0] if isinstance(data, list) else data
+        raw_zones = raw_data.get('zones', [])
+        
+        if 'json_metadata' not in st.session_state:
+            st.session_state.json_metadata = {}
+        st.session_state.json_metadata[filename] = {
+            "id": raw_data.get("id"),
+            "name": raw_data.get("name")
+        }
+        
         new_zones = []
         for z in raw_zones:
             z_id = f"json-{uuid.uuid4().hex[:8]}"
@@ -223,11 +232,15 @@ def handle_json(content, filename):
             merc_list = [f"{latlng_to_mercator(lat, lng)[0]:.6f};{latlng_to_mercator(lat, lng)[1]:.6f}" for lng, lat in coords]
             new_zones.append({
                 "id": z_id,
+                "original_id": z.get("id"),
                 "name": z.get('name', 'Zone JSON'),
                 "startdepot": "33",
                 "polygon": ";".join(merc_list),
                 "color": z.get('color', None),
-                "source_file": filename
+                "source_file": filename,
+                "vehicle_id": z.get("vehicle_id"),
+                "speed_multiplicator": z.get("speed_multiplicator", 1),
+                "speed_multiplier": z.get("speed_multiplier", 1)
             })
             st.session_state[f"state_chk_{z_id}"] = True
         st.session_state.zones.extend(new_zones)
@@ -840,6 +853,7 @@ def export_confirmation_dialog(export_df, anomalies_mask, anomalies_count):
     c1, c2 = st.columns(2)
     with c1:
         if st.download_button("✅ Oui", csv_data, "campagne_forge_ok.csv", "text/csv", use_container_width=True, type="primary"):
+            st.toast("✅ Fichier téléchargé avec succès !", icon="✅")
             st.rerun()
     with c2:
         if st.button("❌ Non", use_container_width=True):
@@ -987,7 +1001,8 @@ def main():
                     else:
                         export_df = export_df.drop(columns=['Statut_Forge'])
                         csv_data = export_df.to_csv(index=False, sep=';').encode('utf-8-sig')
-                        st.download_button("📥 Télécharger CSV", csv_data, "campagne_forge_ok.csv", "text/csv", use_container_width=True, type="primary")
+                        if st.download_button("📥 Télécharger CSV", csv_data, "campagne_forge_ok.csv", "text/csv", use_container_width=True, type="primary"):
+                            st.toast("✅ Fichier téléchargé avec succès !", icon="✅")
 
                 if st.session_state.zones:
                     st.caption("🗺️ **Secteurs** : Téléchargez les fichiers d'origine avec polygones modifiés.")
@@ -1000,38 +1015,75 @@ def main():
                         
                     for src_file, z_list in zones_by_file.items():
                         if src_file.endswith('.json'):
-                            out_data = {"zones": []}
+                            root_meta = st.session_state.get('json_metadata', {}).get(src_file, {})
+                            
+                            out_data = {
+                                "id": root_meta.get("id") or 0,
+                                "name": root_meta.get("name") or src_file.replace('.json', ''),
+                                "zones": []
+                            }
+                            
+                            token_map = {}
                             for z in z_list:
                                 raw = [float(p) for p in z['polygon'].split(';') if p]
                                 pts = [mercator_to_latlng(raw[i], raw[i+1]) for i in range(0, len(raw), 2)]
                                 poly_coords = [[[pt[1], pt[0]] for pt in pts]]
-                                out_data["zones"].append({
-                                    "name": z['name'],
-                                    "color": z.get('color'),
-                                    "polygon": {
-                                        "geometry": {
-                                            "type": "Polygon",
-                                            "coordinates": poly_coords
-                                        }
+                                
+                                poly_dict = {
+                                    "type": "Feature",
+                                    "geometry": {
+                                        "type": "Polygon",
+                                        "coordinates": poly_coords
                                     }
-                                })
+                                }
+                                token = f"__POLY_{uuid.uuid4().hex}__"
+                                token_map[token] = json.dumps(poly_dict, separators=(',', ':'))
+                                
+                                zone_obj = {
+                                    "name": z['name'],
+                                    "polygon": token,
+                                    "speed_multiplicator": z.get("speed_multiplicator", 1),
+                                    "speed_multiplier": z.get("speed_multiplier", 1)
+                                }
+                                    
+                                out_data["zones"].append(zone_obj)
                             
-                            json_str = json.dumps(out_data, indent=2, ensure_ascii=False).encode('utf-8')
-                            st.download_button(
+                            json_text = json.dumps([out_data], indent=2, ensure_ascii=False)
+                            for t, poly_str in token_map.items():
+                                json_text = json_text.replace(f'"{t}"', poly_str)
+                                
+                            json_str = json_text.encode('utf-8')
+                            if st.download_button(
                                 label=f"📥 Télécharger {src_file}",
                                 data=json_str,
                                 file_name=f"corrige_{src_file}",
                                 mime="application/json",
                                 use_container_width=True
-                            )
+                            ):
+                                st.toast("✅ Fichier téléchargé avec succès !", icon="✅")
 
         with tab_tools:
             if st.session_state.clients_df is not None or st.session_state.zones:
                 st.markdown("#### 🛠️ Outils Globaux")
                 if st.session_state.clients_df is not None:
                     st.checkbox("🚨 Ne montrer que les anomalies", key="show_only_anomalies", help="Masque les clients déjà validés pour se concentrer sur les corrections.")
+                    
+                    if st.button("🗑️ Vider les clients", use_container_width=True, help="Supprime la liste des clients en cours et nettoie la carte"):
+                        st.session_state.clients_df = None
+                        st.session_state.selected_client_idx = None
+                        if 'saved_focus' in st.session_state:
+                            del st.session_state['saved_focus']
+                        st.rerun()
                 if st.session_state.zones:
                     st.slider("Opacité des secteurs", min_value=0.0, max_value=1.0, value=0.2, step=0.1, key="polygon_opacity", help="Ajuste la transparence des polygones colorés.")
+                    
+                    if st.button("🗑️ Vider les secteurs", use_container_width=True, help="Supprime tous les secteurs en cours et réinitialise la carte"):
+                        st.session_state.zones = []
+                        if 'json_metadata' in st.session_state:
+                            st.session_state.json_metadata = {}
+                        if st.session_state.clients_df is not None:
+                            st.session_state.clients_df = run_zoning_algorithm(st.session_state.clients_df)
+                        st.rerun()
                 st.divider()
 
             if st.session_state.zones:
