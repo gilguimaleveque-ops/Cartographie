@@ -1049,9 +1049,7 @@ def main():
                                 
                                 zone_obj = {
                                     "name": z['name'],
-                                    "polygon": token,
-                                    "speed_multiplicator": z.get("speed_multiplicator", 1),
-                                    "speed_multiplier": z.get("speed_multiplier", 1)
+                                    "polygon": token
                                 }
                                     
                                 out_data["zones"].append(zone_obj)
@@ -1061,10 +1059,13 @@ def main():
                                 json_text = json_text.replace(f'"{t}"', poly_str)
                                 
                             json_str = json_text.encode('utf-8')
+                            
+                            timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+                            base_name = src_file.replace('.json', '')
                             if st.download_button(
                                 label=f"📥 Télécharger {src_file}",
                                 data=json_str,
-                                file_name=f"corrige_{src_file}",
+                                file_name=f"corrige_{base_name}_{timestamp}.json",
                                 mime="application/json",
                                 use_container_width=True
                             ):
